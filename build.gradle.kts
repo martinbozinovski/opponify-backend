@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension
+
 plugins {
     kotlin("jvm") version "2.2.20" apply false
     kotlin("plugin.spring") version "2.2.20" apply false
@@ -17,7 +19,7 @@ allprojects {
 subprojects {
     apply(plugin = "org.jetbrains.kotlin.jvm")
 
-    kotlin {
+    extensions.configure<KotlinJvmProjectExtension> {
         jvmToolchain(21)
     }
 
