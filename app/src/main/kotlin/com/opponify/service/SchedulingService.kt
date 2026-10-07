@@ -75,7 +75,7 @@ class SchedulingService(
         val confirmed=jdbc.queryForObject("SELECT COUNT(*) FROM game_change_confirmations WHERE change_id=?",Int::class.java,changeId) ?: 0
         if(expected==0 || confirmed<expected) return
         val type=row["change_type"] as String
-        val proposed=mapper.readTree(row["proposed_value"] as String)
+        val proposed=mapper.readTree(row["proposed_value"].toString())
         when(type) {
             "START_TIME" -> {
                 val start=Instant.parse(proposed.asText())
