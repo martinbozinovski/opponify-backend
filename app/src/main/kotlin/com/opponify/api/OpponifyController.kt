@@ -16,8 +16,11 @@ class OpponifyController(private val service: OpponifyService, private val users
     @ResponseStatus(HttpStatus.CREATED)
     fun create(@RequestBody request:CreateOpportunityRequest, auth:Authentication)=service.createOpportunity(users.resolve(actor(auth)),request)
 
+    @GetMapping("/opportunities/{id}")
+    fun get(@PathVariable id:UUID,auth:Authentication)=service.getOpportunity(users.resolve(auth.name),id)
+
     @GetMapping("/opportunities")
-    fun discover(@RequestParam(required=false) sport:SportCode?,@RequestParam(required=false) town:String?,@RequestParam(defaultValue="50") limit:Int,auth:Authentication)=service.discover(users.resolve(auth.name),sport,town,limit,null)
+    fun discover(@RequestParam(required=false) sport:SportCode?,@RequestParam(required=false) town:String?,@RequestParam(defaultValue="50") limit:Int,@RequestParam(required=false) cursor:String?,auth:Authentication)=service.discover(users.resolve(auth.name),sport,town,limit,cursor)
 
     @PostMapping("/opportunities/{id}/requests")
     @ResponseStatus(HttpStatus.CREATED)

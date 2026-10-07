@@ -44,6 +44,9 @@ class OpponifyService(
     }
 
     @Transactional(readOnly=true)
+    fun getOpportunity(viewer:UUID,id:UUID):Opportunity { val o=opportunities.find(id) ?: throw ApiException(404,"OPPORTUNITY_NOT_FOUND","Opportunity not found."); return o }
+
+    @Transactional(readOnly=true)
     fun discover(viewer:UUID,sport:com.opponify.sport.domain.SportCode?,town:String?,limit:Int,cursor:String?)=opportunities.list(sport,town,OpportunityStatus.OPEN,limit.coerceIn(1,100),viewer,cursor)
 
     @Transactional
@@ -60,29 +63,32 @@ class OpponifyService(
         val opportunityId=request["opportunity_id"] as UUID
         val o=opportunities.find(opportunityId) ?: throw ApiException(404,"OPPORTUNITY_NOT_FOUND","Opportunity not found.")
         val requesterUser=request["requester_user_id"] as UUID?
-        val creatorUserId = o.creatorUserId
-        if(requesterUser!=null && creatorUserId!=null && (jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM blocks WHERE (blocker_user_id=? AND blocked_user_id=?) OR (blocker_user_id=? AND blocked_user_id=?))",Boolean::class.java,creatorUserId,requesterUser,requesterUser,creatorUserId)?:false)) throw ApiException(409,"USER_BLOCKED","Participation cannot proceed because the users are blocked.")
-        val creatorTeamId = o.creatorTeamId
-        if(creatorUserId!=actor && (creatorTeamId==null || !canManageTeam(actor,creatorTeamId))) throw ApiException(403,"CREATOR_AUTHORITY_REQUIRED","Only the opportunity creator or authorized team representative can accept.")
+        if(requesterUser!=null && o.creatorUserId!=null && (jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM blocks WHERE (blocker_user_id=? AND blocked_user_id=?) OR (blocker_user_id=? AND blocked_user_id=?))",Boolean::class.java,o.creatorUserId,requesterUser,requesterUser,o.creatorUserId)?:false)) throw ApiException(409,"USER_BLOCKED","Participation cannot proceed because the users are blocked.")
+        if(o.creatorUserId!=actor && (o.creatorTeamId==null || !canManageTeam(actor,o.creatorTeamId))) throw ApiException(403,"CREATOR_AUTHORITY_REQUIRED","Only the opportunity creator or authorized team representative can accept.")
         if(o.status!=OpportunityStatus.OPEN) throw ApiException(409,"OPPORTUNITY_NOT_OPEN","Opportunity is no longer open.")
         if(requesterUser!=null && jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM participation_requests WHERE opportunity_id=? AND requester_user_id=? AND status='ACCEPTED')",Boolean::class.java,o.id,requesterUser)==true) throw ApiException(409,"ALREADY_ACCEPTED","Requester already has accepted participation in this opportunity.")
         if(request["requester_team_id"]!=null && jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM participation_requests WHERE opportunity_id=? AND requester_team_id=? AND status='ACCEPTED')",Boolean::class.java,o.id,request["requester_team_id"] as UUID)==true) throw ApiException(409,"ALREADY_ACCEPTED","Team already has accepted participation in this opportunity.")
         jdbc.queryForObject("SELECT id FROM opportunities WHERE id=? FOR UPDATE",UUID::class.java,opportunityId) ?: throw ApiException(404,"OPPORTUNITY_NOT_FOUND","Opportunity not found.")
         val accepted=requests.pendingCount(opportunityId)
-        if(1 + accepted >= o.targetCapacity) throw ApiException(409,"CAPACITY_FULL","Target capacity has been reached.")
+        if(accepted >= o.targetCapacity) throw ApiException(409,"CAPACITY_FULL","Target capacity has been reached.")
         if(requests.accept(requestId)!=1) return requestId
         val gameId = if(o.timeType==TimeType.EXACT) {
-            val id=UUID.randomUUID(); val start=o.startAt ?: throw ApiException(409,"EXACT_TIME_REQUIRED","Cannot schedule without exact time.")
+            val start=o.startAt ?: throw ApiException(409,"EXACT_TIME_REQUIRED","Cannot schedule without exact time.")
             val end=start.plus(defaultDuration)
-            val creatorUsers = if (creatorUserId != null) listOf(creatorUserId) else teamUsers(creatorTeamId ?: throw ApiException(422,"CREATOR_REQUIRED","Opportunity creator is missing."))
-            if(creatorUsers.any { games.hasOverlap(it,start,end) }) throw ApiException(409,"SCHEDULE_OVERLAP","A creator participant has an overlapping scheduled commitment.")
+            val existing=jdbc.queryForList("SELECT id FROM scheduled_games WHERE opportunity_id=? AND lifecycle NOT IN ('CANCELLED','NOT_PLAYED') ORDER BY created_at LIMIT 1",o.id).firstOrNull()
+            val id=existing?.get("id") as UUID? ?: UUID.randomUUID()
+            if(existing==null){
+                val creatorUsers=participantUsersForOpportunity(o)
+                if(creatorUsers.any{games.hasOverlap(it,start,end)}) throw ApiException(409,"SCHEDULE_OVERLAP","A creator participant has an overlapping scheduled commitment.")
+                games.create(id,o.id,start,defaultDuration,ZoneId.of("UTC"))
+                if(o.creatorUserId!=null) games.addParticipant(id,o.creatorUserId,null) else games.addParticipant(id,null,o.creatorTeamId)
+            }
+            if(games.activeCount(id) >= o.targetCapacity) throw ApiException(409,"CAPACITY_FULL","Target capacity has been reached.")
             val requesterTeam=request["requester_team_id"] as UUID?
             val requesterUsers=if(requesterUser!=null) listOf(requesterUser) else teamUsers(requesterTeam!!)
-            if(requesterUsers.any{games.hasOverlap(it,start,end)}) throw ApiException(409,"SCHEDULE_OVERLAP","A participant has an overlapping scheduled commitment.")
-            games.create(id,o.id,start,defaultDuration,ZoneId.of("UTC"))
-            if (creatorUserId != null) games.addParticipant(id,creatorUserId,null)
-            else games.addParticipant(id,null,creatorTeamId ?: throw ApiException(422,"CREATOR_REQUIRED","Opportunity creator is missing."))
+            if(requesterUsers.any{games.hasOverlap(it,start,end) && !isAlreadyGameParticipant(id,it)}) throw ApiException(409,"SCHEDULE_OVERLAP","A participant has an overlapping scheduled commitment.")
             if(requesterUser!=null) games.addParticipant(id,requesterUser,null) else games.addParticipant(id,null,requesterTeam)
+            if(games.activeCount(id) >= o.targetCapacity) jdbc.update("UPDATE opportunities SET status='CLOSED',updated_at=NOW() WHERE id=? AND status='OPEN'",o.id)
             id
         } else null
         audit(actor,"PARTICIPATION_ACCEPTED","request",requestId); return gameId ?: requestId
@@ -92,9 +98,7 @@ class OpponifyService(
     fun creatorWithdrawAccepted(actor:UUID,requestId:UUID) {
         val r=requests.find(requestId) ?: throw ApiException(404,"REQUEST_NOT_FOUND","Request not found.")
         val o=opportunities.find(r["opportunity_id"] as UUID) ?: throw ApiException(404,"OPPORTUNITY_NOT_FOUND","Opportunity not found.")
-        val creatorUserId = o.creatorUserId
-        val creatorTeamId = o.creatorTeamId
-        if(creatorUserId!=actor && (creatorTeamId==null || !canManageTeam(actor,creatorTeamId))) throw ApiException(403,"CREATOR_AUTHORITY_REQUIRED","Creator authority required.")
+        if(o.creatorUserId!=actor && (o.creatorTeamId==null || !canManageTeam(actor,o.creatorTeamId))) throw ApiException(403,"CREATOR_AUTHORITY_REQUIRED","Creator authority required.")
         if(jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM scheduled_games WHERE opportunity_id=?)",Boolean::class.java,o.id)==true) throw ApiException(409,"ALREADY_SCHEDULED","Accepted participation cannot be creator-withdrawn after scheduling.")
         if(requests.withdraw(requestId)!=1) throw ApiException(409,"REQUEST_NOT_WITHDRAWABLE","Accepted participation cannot be withdrawn in its current state.")
         audit(actor,"ACCEPTED_PARTICIPATION_WITHDRAWN_BY_CREATOR","request",requestId)
@@ -150,7 +154,7 @@ class OpponifyService(
         if(Instant.now().isAfter(game.endAt.plus(resolutionWindow))) throw ApiException(409,"POST_GAME_WINDOW_EXPIRED","The post-game resolution window has expired.")
         val updated=jdbc.update("UPDATE results SET state='CONFIRMED',confirmed_by=?,updated_at=NOW() WHERE game_id=? AND state='SUBMITTED' AND submitted_by<>?",actor,gameId,actor)
         if(updated!=1) throw ApiException(409,"RESULT_NOT_CONFIRMABLE","No submitted result is awaiting confirmation.")
-        games.updateLifecycle(gameId,"PLAYED"); val eventId=UUID.randomUUID(); audit(actor,"RESULT_CONFIRMED","game",gameId); addCompletionEvidence(gameId,eventId)
+        games.updateLifecycle(gameId,"PLAYED"); val eventId=UUID.randomUUID(); audit(actor,"RESULT_CONFIRMED","game",gameId); addCompletionEvidence(gameId,eventId); addResultEvidence(gameId,eventId)
     }
 
     @Transactional
@@ -177,12 +181,28 @@ class OpponifyService(
     @Transactional
     fun report(actor:UUID,subject:UUID?,category:String,description:String?):UUID { val id=UUID.randomUUID(); jdbc.update("INSERT INTO reports(id,reporter_user_id,subject_id,category,description) VALUES(?,?,?,?,?)",id,actor,subject,category,description); audit(actor,"REPORT_CREATED","report",id); return id }
 
+    private fun addResultEvidence(gameId:UUID,eventId:UUID){
+        jdbc.queryForList("SELECT participant_user_id,participant_team_id FROM game_participants WHERE game_id=? AND status='ACTIVE'",gameId).forEach { row ->
+            val user=row["participant_user_id"] as UUID?
+            val team=row["participant_team_id"] as UUID?
+            if(user!=null) trust.addEvidence(user,UUID.nameUUIDFromBytes("$eventId:RESULT:$user".toByteArray()),"CONFIRMED_RESULT",0,subjectType="USER")
+            if(team!=null) trust.addEvidence(team,UUID.nameUUIDFromBytes("$eventId:RESULT:TEAM:$team".toByteArray()),"CONFIRMED_RESULT",0,subjectType="TEAM")
+        }
+    }
+
     private fun addCompletionEvidence(gameId:UUID,eventId:UUID){
-        val participants=jdbc.queryForList("SELECT participant_user_id FROM game_participants WHERE game_id=? AND status='ACTIVE' AND participant_user_id IS NOT NULL",gameId).map{it["participant_user_id"] as UUID}
-        participants.forEach { subject ->
-            val opponents=participants.filter{it!=subject}
+        val participants=jdbc.queryForList("SELECT participant_user_id,participant_team_id FROM game_participants WHERE game_id=? AND status='ACTIVE'",gameId)
+        val users=participants.mapNotNull{it["participant_user_id"] as UUID?}
+        val teams=participants.mapNotNull{it["participant_team_id"] as UUID?}
+        users.forEach { subject ->
+            val opponents=users.filter{it!=subject}
             if(opponents.isEmpty()) trust.addEvidence(subject,UUID.nameUUIDFromBytes("$eventId:$subject".toByteArray()),"CONFIRMED_GAME",0)
             else opponents.forEach{opponent->trust.addEvidence(subject,UUID.nameUUIDFromBytes("$eventId:$subject:$opponent".toByteArray()),"CONFIRMED_GAME",0,opponent)}
+        }
+        teams.forEach { subject ->
+            val opponents=teams.filter{it!=subject}
+            if(opponents.isEmpty()) trust.addEvidence(subject,UUID.nameUUIDFromBytes("$eventId:TEAM:$subject".toByteArray()),"CONFIRMED_GAME",0,subjectType="TEAM")
+            else opponents.forEach{opponent->trust.addEvidence(subject,UUID.nameUUIDFromBytes("$eventId:TEAM:$subject:$opponent".toByteArray()),"CONFIRMED_GAME",0,opponent,"TEAM")}
         }
     }
 
@@ -191,18 +211,6 @@ class OpponifyService(
         val team=jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM game_participants p JOIN team_memberships m ON m.team_id=p.participant_team_id WHERE p.game_id=? AND m.user_id=? AND m.status='ACTIVE' AND p.status='ACTIVE')",Boolean::class.java,gameId,actor) ?: false
         if(!direct && !team) throw ApiException(403,"GAME_PARTICIPANT_REQUIRED","User is not an active game participant.")
     }
-    private fun teamUsers(teamId: UUID): List<UUID> =
-        jdbc.queryForList(
-            "SELECT user_id FROM team_memberships WHERE team_id=? AND status='ACTIVE' AND role IN ('CAPTAIN','MANAGER')",
-            teamId
-        ).mapNotNull { it["user_id"] as UUID? }
-
-    private fun participantUsersForOpportunity(o: Opportunity): List<UUID> {
-        val creatorUserId = o.creatorUserId
-        return if (creatorUserId != null) listOf(creatorUserId)
-        else o.creatorTeamId?.let(::teamUsers).orEmpty()
-    }
-
     private fun canManageTeam(actor:UUID,teamId:UUID):Boolean=jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM team_memberships WHERE team_id=? AND user_id=? AND status='ACTIVE' AND role IN ('CAPTAIN','MANAGER'))",Boolean::class.java,teamId,actor) ?: false
     private fun audit(actor:UUID,action:String,type:String,id:UUID){
         val eventId=UUID.randomUUID()

@@ -10,25 +10,23 @@ import java.time.Instant
 import java.util.UUID
 
 @Service
-class AttendanceService(
-    private val jdbc: JdbcTemplate,
-    private val trust: TrustService,
-    @Value("\${opponify.post-game.resolution-window}") private val resolutionWindow: Duration
-) {
+class AttendanceService(private val jdbc:JdbcTemplate, private val trust:TrustService) {
     @Transactional
     fun claim(actor:UUID,gameId:UUID,participantKey:String,state:String){
         val allowed=setOf("CLAIMED_ATTENDED","CLAIMED_ABSENT")
         if(state !in allowed)throw ApiException(422,"INVALID_ATTENDANCE_CLAIM","Only attendance claims can be submitted here.")
         ensureParticipant(actor,gameId)
-        val start=jdbc.queryForObject("SELECT start_at FROM scheduled_games WHERE id=?",java.sql.Timestamp::class.java,gameId)?.toInstant() ?: throw ApiException(404,"GAME_NOT_FOUND","Game not found.")
-        if(Instant.now().isBefore(start) || Instant.now().isAfter(start.plus(resolutionWindow))) throw ApiException(409,"POST_GAME_WINDOW_INVALID","Attendance is outside its resolution window.")
+        val row=jdbc.queryForList("SELECT start_at,duration_seconds FROM scheduled_games WHERE id=?",gameId).firstOrNull() ?: throw ApiException(404,"GAME_NOT_FOUND","Game not found.")
+        val start=(row["start_at"] as java.sql.Timestamp).toInstant(); val end=start.plusSeconds((row["duration_seconds"] as Number).toLong())
+        if(Instant.now().isBefore(end) || Instant.now().isAfter(end.plus(resolutionWindow))) throw ApiException(409,"POST_GAME_WINDOW_INVALID","Attendance is outside its resolution window.")
         jdbc.update("INSERT INTO attendance_events(id,game_id,participant_key,submitted_by,state) VALUES(?,?,?,?,?)",UUID.randomUUID(),gameId,participantKey,actor,state)
     }
     @Transactional
     fun confirm(actor:UUID,gameId:UUID,participantKey:String,state:String){
         ensureParticipant(actor,gameId)
-        val start=jdbc.queryForObject("SELECT start_at FROM scheduled_games WHERE id=?",java.sql.Timestamp::class.java,gameId)?.toInstant() ?: throw ApiException(404,"GAME_NOT_FOUND","Game not found.")
-        if(Instant.now().isBefore(start) || Instant.now().isAfter(start.plus(resolutionWindow))) throw ApiException(409,"POST_GAME_WINDOW_INVALID","Attendance confirmation is outside its resolution window.")
+        val row=jdbc.queryForList("SELECT start_at,duration_seconds FROM scheduled_games WHERE id=?",gameId).firstOrNull() ?: throw ApiException(404,"GAME_NOT_FOUND","Game not found.")
+        val start=(row["start_at"] as java.sql.Timestamp).toInstant(); val end=start.plusSeconds((row["duration_seconds"] as Number).toLong())
+        if(Instant.now().isBefore(end) || Instant.now().isAfter(end.plus(resolutionWindow))) throw ApiException(409,"POST_GAME_WINDOW_INVALID","Attendance confirmation is outside its resolution window.")
         val expected=if(state=="CONFIRMED_ABSENT")"CLAIMED_ABSENT" else if(state=="CONFIRMED_ATTENDED")"CLAIMED_ATTENDED" else throw ApiException(422,"INVALID_CONFIRMATION","Unsupported attendance confirmation.")
         val claim=jdbc.queryForList("SELECT * FROM attendance_events WHERE game_id=? AND participant_key=? AND state=? AND submitted_by<>? ORDER BY created_at DESC LIMIT 1",gameId,participantKey,expected,actor).firstOrNull() ?: throw ApiException(409,"NO_OTHER_CLAIM","A matching claim from another participant is required.")
         val eventId=UUID.randomUUID()

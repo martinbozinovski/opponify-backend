@@ -12,7 +12,7 @@ class SecurityConfig(@Value("\${opponify.security.dev-mode:false}") private val 
     @Bean
     fun securityFilterChain(http:HttpSecurity):SecurityFilterChain {
         http.csrf { it.disable() }.sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }.authorizeHttpRequests {
-            it.requestMatchers("/api/v1/health","/actuator/health","/api/v1/openapi/**","/api/v1/docs/**","/swagger-ui/**").permitAll().anyRequest().authenticated()
+            it.requestMatchers("/api/v1/health","/actuator/health").permitAll().anyRequest().authenticated()
         }
         return http.build()
     }

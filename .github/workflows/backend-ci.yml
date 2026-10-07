@@ -9,6 +9,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: opponify
+          POSTGRES_USER: opponify
+          POSTGRES_PASSWORD: opponify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U opponify -d opponify"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - name: Set up JDK 21
@@ -23,3 +37,19 @@ jobs:
           gradle-version: '8.14.3'
       - name: Build and test
         run: gradle clean test bootJar --no-daemon
+      - name: Validate Flyway against clean PostgreSQL/PostGIS
+        env:
+          DB_URL: jdbc:postgresql://127.0.0.1:5432/opponify
+          DB_USERNAME: opponify
+          DB_PASSWORD: opponify
+          OPPONIFY_SECURITY_DEV_MODE: 'true'
+        run: |
+          gradle bootRun --no-daemon > /tmp/opponify.log 2>&1 &
+          pid=$!
+          trap 'kill $pid || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/api/v1/health >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          cat /tmp/opponify.log
+          exit 1
