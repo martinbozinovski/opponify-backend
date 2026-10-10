@@ -10,7 +10,11 @@ import java.time.Instant
 import java.util.UUID
 
 @Service
-class AttendanceService(private val jdbc:JdbcTemplate, private val trust:TrustService) {
+class AttendanceService(
+    private val jdbc:JdbcTemplate,
+    private val trust:TrustService,
+    @Value("\${opponify.post-game.resolution-window}") private val resolutionWindow:Duration
+) {
     @Transactional
     fun claim(actor:UUID,gameId:UUID,participantKey:String,state:String){
         val allowed=setOf("CLAIMED_ATTENDED","CLAIMED_ABSENT")

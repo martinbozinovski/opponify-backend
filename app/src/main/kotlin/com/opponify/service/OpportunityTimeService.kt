@@ -18,7 +18,7 @@ class OpportunityTimeService(private val jdbc:JdbcTemplate,private val opportuni
         val o=opportunities.find(opportunityId)?:throw ApiException(404,"OPPORTUNITY_NOT_FOUND","Opportunity not found.")
         if(o.status.name!="OPEN")throw ApiException(409,"OPPORTUNITY_NOT_OPEN","Opportunity must be open for time coordination.")
         if(o.timeType.name=="EXACT")throw ApiException(409,"EXACT_TIME_ALREADY_DEFINED","Exact-time opportunities do not need a time proposal.")
-        if(actor!=o.creatorUserId && (o.creatorTeamId==null || !canManageTeam(actor,o.creatorTeamId)))throw ApiException(403,"CREATOR_AUTHORITY_REQUIRED","Creator authority required to propose exact time.")
+        if(actor!=o.creatorUserId && (o.creatorTeamId?.let{canManageTeam(actor,it)}!=true))throw ApiException(403,"CREATOR_AUTHORITY_REQUIRED","Creator authority required to propose exact time.")
         if(start.isBefore(Instant.now()))throw ApiException(422,"TIME_IN_PAST","Proposed time must be future-dated.")
         jdbc.update("UPDATE opportunity_time_proposals SET status='SUPERSEDED' WHERE opportunity_id=? AND status='PROPOSED'",opportunityId)
         val id=UUID.randomUUID();jdbc.update("INSERT INTO opportunity_time_proposals(id,opportunity_id,proposed_start_at,proposer_user_id,expires_at) VALUES(?,?,?,?,?)",id,opportunityId,start,actor,Instant.now().plus(expiry));return id
@@ -43,7 +43,7 @@ class OpportunityTimeService(private val jdbc:JdbcTemplate,private val opportuni
         return gameId
     }
     private fun requiredConfirmers(o:com.opponify.opportunity.domain.Opportunity):Set<UUID>{
-        val users=mutableSetOf<UUID>();if(o.creatorUserId!=null)users+=o.creatorUserId else users+=teamReps(o.creatorTeamId!!)
+        val users=mutableSetOf<UUID>();val creator=o.creatorUserId;if(creator!=null)users+=creator else users+=teamReps(o.creatorTeamId!!)
         jdbc.queryForList("SELECT requester_user_id,requester_team_id FROM participation_requests WHERE opportunity_id=? AND status='ACCEPTED'",o.id).forEach{if(it["requester_user_id"]!=null)users+=it["requester_user_id"] as UUID else users+=teamReps(it["requester_team_id"] as UUID)}
         return users
     }
